@@ -553,7 +553,7 @@ void send_help_message(server_t server, char* client_name){
     }
 }
 
-void show_users_rooms(server_t server, char* client_name, char* arg){
+void show_user_rooms(server_t server, char* client_name, char* arg){
     message_t response; 
     response.type = ROOM_MESSAGE;
     char rooms_list[BUFFER_SIZE] ;
