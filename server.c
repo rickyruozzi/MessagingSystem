@@ -411,6 +411,7 @@ void join_room(client_t client, char* room_name){
     new_room.clients[client.socket] = &client;
     state.rooms[state.room_count++] = new_room;
     client.state = IN_ROOM;
+    notify_room_join(client, room_name);
 }
 
 void leave_room(client_t client, char* room_name){
@@ -421,6 +422,7 @@ void leave_room(client_t client, char* room_name){
             return;
         }
     }
+    notify_room_leave(client, room_name);
 }
 
 void cleanup_client(client_t *client){
@@ -587,4 +589,38 @@ void show_room_users(server_t server, char* client_name, char * arg){
     user_list[strlen(user_list) - 1] = '\0';
     snprintf(response.content, BUFFER_SIZE, "Users in room %s:\n%s", arg, user_list);
     send_message_to_client(server, client_name, response);
+}
+
+void notify_room_join(client_t client, char* room_name){
+    message_t notification; 
+    notification.type = ROOM_MESSAGE;
+    snprintf(notification.content, BUFFER_SIZE, "%s has joined the room!", client.name);
+    for(int i=0; i<state.room_count; i++){
+        if(strcmp(state.rooms[i].room_name, room_name) == 0){
+            for(int j=0; j<state.rooms[i].client_count; j++){
+                if(state.rooms[i].clients[j] != NULL && state.rooms[i].clients[j]->socket != client.socket){
+                    send_message(*state.rooms[i].clients[j], notification);
+                }
+            }
+            break;
+        }
+    }
+}
+
+void notify_room_leave(client_t client, char* room_name){
+    message_t notification; 
+    notification.type = ROOM_MESSAGE;
+    char content[BUFFER_SIZE];
+    memset(content, 0, sizeof(content));
+    snprintf(content, BUFFER_SIZE, "%s has left the room!", client.name);
+    for(int i=0; i<state.room_count; i++){
+        if(strcmp(state.rooms[i].room_name, room_name) == 0){
+            for(int j=0; j<state.rooms[i].client_count; j++){
+                if(state.rooms[i].clients[j] != NULL && state.rooms[i].clients[j]->socket != client.socket){
+                    send_message(*state.rooms[i].clients[j], notification);
+                }
+            }
+            break;
+        }
+    }
 }
