@@ -1,0 +1,195 @@
+OpenSSL - Fondamenti pratici per un progetto socket C
+====================================================
+
+1) COSA E' OPENSSL
+------------------
+OpenSSL e' una libreria C/C++ che fornisce:
+- TLS/SSL (canale cifrato client-server)
+- primitive crittografiche (hash, cifrari, firme, certificati X.509)
+
+Nel tuo progetto chat, OpenSSL serve principalmente a:
+- cifrare il traffico tra client e server (TLS)
+- autenticare il server tramite certificato
+
+
+2) CONCETTI BASE TLS
+--------------------
+TCP da solo:
+- trasmette dati in chiaro
+
+TLS sopra TCP:
+- protegge confidenzialita' (cifratura)
+- protegge integrita' (tamper detection)
+- protegge autenticita' del server (certificato)
+
+Il TLS handshake fa in automatico:
+- negoziazione versione/cipher suite
+- verifica certificato
+- derivazione chiavi di sessione
+
+Dopo handshake:
+- usa SSL_read / SSL_write
+- non usi piu' send / recv direttamente per i payload applicativi
+
+
+3) COMPONENTI PRINCIPALI API
+----------------------------
+- SSL_CTX: configurazione globale TLS (metodo, cert, key, verify, versioni)
+- SSL: sessione TLS associata a una singola connessione socket
+
+Flusso tipico:
+Server:
+1. SSL_CTX_new(TLS_server_method())
+2. carica cert/key
+3. accept(socket)
+4. SSL_new(ctx)
+5. SSL_set_fd(ssl, client_fd)
+6. SSL_accept(ssl)
+7. SSL_read / SSL_write
+8. SSL_shutdown + SSL_free
+
+Client:
+1. SSL_CTX_new(TLS_client_method())
+2. configura trust CA/verifica
+3. connect(socket)
+4. SSL_new(ctx)
+5. SSL_set_fd(ssl, fd)
+6. SSL_connect(ssl)
+7. SSL_read / SSL_write
+8. SSL_shutdown + SSL_free
+
+
+4) INCLUDE E LINKING (WINDOWS)
+-------------------------------
+Include tipici:
+- <openssl/ssl.h>
+- <openssl/err.h>
+
+Linking tipico:
+- libssl
+- libcrypto
+(+ su Windows: ws2_32, crypt32 in base al toolchain)
+
+Con gcc/msys2 spesso:
+- -lssl -lcrypto
+
+
+5) CERTIFICATI E CHIAVI
+-----------------------
+Server minimo richiede:
+- certificato PEM (es. server.crt)
+- chiave privata PEM (es. server.key)
+
+API fondamentali:
+- SSL_CTX_use_certificate_file(ctx, "server.crt", SSL_FILETYPE_PEM)
+- SSL_CTX_use_PrivateKey_file(ctx, "server.key", SSL_FILETYPE_PEM)
+- SSL_CTX_check_private_key(ctx)
+
+Senza cert/key validi:
+- handshake fallisce
+
+In produzione:
+- usare certificati affidabili
+- proteggere la chiave privata (permessi, storage sicuro)
+
+
+6) ERROR HANDLING
+-----------------
+Controllare SEMPRE valori di ritorno.
+
+In caso errore TLS:
+- ERR_print_errors_fp(stderr)
+- SSL_get_error(ssl, ret) per capire tipo di errore
+
+Errori comuni:
+- certificato non caricato
+- private key non compatibile
+- versione TLS non supportata
+- handshake interrotto dal peer
+
+
+7) CLEANUP CORRETTO
+-------------------
+Per ogni connessione:
+1. SSL_shutdown(ssl)
+2. SSL_free(ssl)
+3. close(socket)
+
+Per il contesto globale:
+- SSL_CTX_free(ctx)
+
+Best practice:
+- evitare leak di SSL/SSL_CTX
+- non chiudere il socket prima di aver tentato SSL_shutdown
+
+
+8) SICUREZZA CONSIGLIATA (BASELINE)
+-----------------------------------
+- Impostare minimo TLS 1.2 o 1.3
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)
+- Verifica certificato lato client attiva
+- Evitare cipher deboli
+- Non loggare segreti (password, chiavi, proof completi)
+
+
+9) TLS VS AUTENTICAZIONE APPLICATIVA
+------------------------------------
+TLS e challenge-response (nonce + proof) sono complementari:
+- TLS protegge canale (MITM, sniffing)
+- challenge-response protegge login applicativo da replay semplice
+
+Usare entrambi e' una scelta solida.
+
+
+10) CHECKLIST RAPIDA INTEGRAZIONE
+---------------------------------
+[ ] include ssl.h e err.h
+[ ] crea SSL_CTX server/client
+[ ] server carica cert e key
+[ ] client verifica certificato server
+[ ] handshake: SSL_accept / SSL_connect
+[ ] sostituisci send/recv con SSL_write/SSL_read
+[ ] gestisci errori OpenSSL
+[ ] cleanup: SSL_shutdown, SSL_free, SSL_CTX_free
+
+
+11) ESEMPIO MINIMO (PSEUDOCODICE)
+---------------------------------
+Server:
+ctx = SSL_CTX_new(TLS_server_method())
+load_cert_key(ctx)
+for (;;) {
+  fd = accept(listen_fd)
+  ssl = SSL_new(ctx)
+  SSL_set_fd(ssl, fd)
+  if (SSL_accept(ssl) <= 0) { cleanup_conn; continue; }
+  SSL_read(ssl, buf, n)
+  SSL_write(ssl, out, m)
+  SSL_shutdown(ssl)
+  SSL_free(ssl)
+  close(fd)
+}
+SSL_CTX_free(ctx)
+
+Client:
+ctx = SSL_CTX_new(TLS_client_method())
+configure_verify(ctx)
+fd = connect(server)
+ssl = SSL_new(ctx)
+SSL_set_fd(ssl, fd)
+if (SSL_connect(ssl) <= 0) { fail }
+SSL_write(ssl, msg, len)
+SSL_read(ssl, resp, cap)
+SSL_shutdown(ssl)
+SSL_free(ssl)
+close(fd)
+SSL_CTX_free(ctx)
+
+
+12) PITFALLS DA EVITARE
+-----------------------
+- creare SSL_CTX a ogni messaggio (sbagliato)
+- mischiare send/recv e SSL_read/SSL_write sulla stessa connessione TLS
+- non verificare il certificato lato client
+- non controllare i return code
+- dimenticare SSL_free/SSL_CTX_free
