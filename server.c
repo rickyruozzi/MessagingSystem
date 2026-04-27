@@ -141,6 +141,20 @@ static int constant_time_equals(const char *a, const char *b, size_t n){
 
 serverstate_t state;
 
+typedef struct client_thread_ctx_t {
+    server_t *server;
+    client_t *client;
+} client_thread_ctx_t;
+
+static void *client_thread_start(void *arg){
+    client_thread_ctx_t *ctx = (client_thread_ctx_t *)arg;
+    if (ctx != NULL) {
+        handle_client(*ctx->server, *ctx->client);
+        free(ctx);
+    }
+    return NULL;
+}
+
 static SSL_CTX* create_server_ctx(void){
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     if (ctx == NULL){
@@ -184,39 +198,67 @@ static SSL_CTX* create_server_ctx(void){
 }
 
 void init_server(serverstate_t *state){
-    state->server.server_socket = socket(AF_INET, SOCK_STREAM, 0); //ipv4, tcp
-    state->server.server_addr.sin_family = AF_INET; 
-    state->server.server_addr.sin_addr.s_addr = INADDR_ANY; //listen on all interfaces
-    state->server->server_addr.sin_port = htons(PORT); //port conversion in network byte order
-    bind(state->server.server_socket, (struct sockaddr*) &state->server.server_addr, sizeof(state->server.server_address));
-    listen(state->server.server_socket, 10); //max 10 pending connections
-    state->server.client_count = 0; 
+    state->server.server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    state->server.server_addr.sin_family = AF_INET;
+    state->server.server_addr.sin_addr.s_addr = INADDR_ANY;
+    state->server.server_addr.sin_port = htons(PORT);
+    bind(state->server.server_socket, (struct sockaddr*)&state->server.server_addr, sizeof(state->server.server_addr));
+    listen(state->server.server_socket, 10);
+    state->server.client_count = 0;
     state->room_count = 0;
-    state->server.ssl_ctx = SSL_LIBRARY_INIT();
+    state->server.ssl_ctx = create_server_ctx();
 }
 
 void start_server(server_t server){
     while(1){
-        int client = accept(server.server_socket, NULL, NULL); 
-        SSL_new(server.ssl_ctx); //create new SSL context for the incoming client connection 
-        SSL_SET_fd(ssl, client); //associate the SSL context with the client socket
-        SSL_accept(ssl); //perform SSL handshake with the client, establishing a secure connection 
-        if(SSL_get_error(ssl, -1) != SSL_ERROR_NONE){
-            ERR_print_errors_fp(stderr); //print any SSL errors that occured during handshake
-            close(client); //close the client socket on failure
-            continue; //skip to next iteration to accept new connections
-        }
-        if(client <0){
+        int client_socket = accept(server.server_socket, NULL, NULL);
+        SSL *ssl;
+        int client_index;
+
+        if(client_socket < 0){
             perror("Accept failed");
             continue;
         }
+
+        ssl = SSL_new(server.ssl_ctx);
+        if (ssl == NULL) {
+            close(client_socket);
+            continue;
+        }
+
+        SSL_set_fd(ssl, client_socket);
+        if (SSL_accept(ssl) <= 0){
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            close(client_socket);
+            continue;
+        }
+
+        if (state.server.client_count >= MAX_CLIENTS) {
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(client_socket);
+            continue;
+        }
+
         client_t new_client;
-        new_client.socket = client;
+        memset(&new_client, 0, sizeof(new_client));
+        new_client.socket = client_socket;
         new_client.state = CONNECTED;
+        new_client.ssl = ssl;
+        client_index = state.server.client_count;
         state.server.clients[state.server.client_count++] = new_client;
 
         pthread_t thread_id;
-        pthread_create(&thread_id, NULL, (void*) handle_client, (void*) &new_client); //ogni thead gestisce un client attraverso handle_client
+        client_thread_ctx_t *ctx = (client_thread_ctx_t *)malloc(sizeof(client_thread_ctx_t));
+        if (ctx == NULL) {
+            cleanup_client(&state.server.clients[client_index]);
+            continue;
+        }
+
+        ctx->server = &state.server;
+        ctx->client = &state.server.clients[client_index];
+        pthread_create(&thread_id, NULL, client_thread_start, ctx);
     }
 }
 
@@ -250,22 +292,26 @@ void handle_client(server_t server, client_t client){
                 cleanup_client(&client);
                 return;
             case PRIVATE_MESSAGE: 
+                acknowledge_message(client, message);
                 send_private_message(server, client, message);
                 break;
             case ROOM_MESSAGE:
                 broadcast_message(server, message);
                 break;
             case JOIN_ROOM:
-                join_room(server, client, message);
+                join_room(&client, message.receiver_name);
                 break;
             case LEAVE_ROOM: 
-                leave_room(server, client, message);
+                leave_room(&client, message.receiver_name);
                 break;
             case PING: 
                 send_message(client, message); 
                 break;
             case AUTH_RESPONSE: 
                 authenticate_client(&client, message);
+                break;
+            case BAN_USER:
+                ban_user_from_room(&client, message.receiver_name, message.content);
                 break;
             default: 
                 printf("Unknown message type from client %s\n", client.name);
@@ -348,6 +394,7 @@ void send_private_message(server_t server, client_t sender, message_t message){
     for(int i=0; i<server.client_count; i++){
         if(strncmp(server.clients[i].name, message.receiver_name, 50) == 0){
             send_message(server.clients[i], message); 
+            store_message(server, NULL, message); //store private message with no room association
             break;
         }
     }
@@ -381,47 +428,136 @@ int receive_message(client_t client, message_t *message){
     return bytes_received;
 }
 
-void join_room(client_t client, char* room_name){
-    if(client.state != AUTHENTICATED){
-        message_t msg; 
-        msg.type = JOIN_ROOM;
-        snprintf(msg.content, BUFFER_SIZE, "You must be authenticated to join a room!");
-        send_message(client, msg);
-        return;
-    }
-
-    if(state.room_count >= 100){
-        message_t msg; 
-        msg.type = JOIN_ROOM;
-        snprintf(msg.content, BUFFER_SIZE, "Room limit reached!");
-        send_message(client, msg);
-        return;
-    }
-
-    for(int i=0; i<state.room_count; i++){
-        if(strncmp(state.rooms[i].room_name, room_name, 50) == 0){
-            state.rooms[i].clients[client.socket] = &client; 
-            client.state = IN_ROOM;
-            return;
+static room_t *find_room_by_name(const char *room_name){
+    for (int i = 0; i < state.room_count; ++i) {
+        if (strncmp(state.rooms[i].room_name, room_name, sizeof(state.rooms[i].room_name)) == 0) {
+            return &state.rooms[i];
         }
     }
-    //room not found, create new
-    room_t new_room;
-    strncpy(new_room.room_name, room_name, 50);
-    new_room.clients[client.socket] = &client;
-    state.rooms[state.room_count++] = new_room;
-    client.state = IN_ROOM;
+    return NULL;
+}
+
+static int find_member_index(const room_t *room, const client_t *client){
+    if (room == NULL || client == NULL) {
+        return -1;
+    }
+
+    for (int i = 0; i < room->member_count; ++i) {
+        if (room->members[i].client != NULL && room->members[i].client->socket == client->socket) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void join_room(client_t *client, char* room_name){
+    room_t *room;
+
+    if(client == NULL){
+        return;
+    }
+
+    if(client->state != AUTHENTICATED){
+        message_t msg; 
+        memset(&msg, 0, sizeof(msg));
+        msg.type = JOIN_ROOM;
+        snprintf(msg.content, BUFFER_SIZE, "You must be authenticated to join a room!");
+        send_message(*client, msg);
+        return;
+    }
+
+    if(room_name == NULL || room_name[0] == '\0'){
+        message_t msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.type = JOIN_ROOM;
+        snprintf(msg.content, BUFFER_SIZE, "Room name is required");
+        send_message(*client, msg);
+        return;
+    }
+
+    room = find_room_by_name(room_name);
+    if (room == NULL && state.room_count >= MAX_ROOMS){
+        message_t msg; 
+        memset(&msg, 0, sizeof(msg));
+        msg.type = JOIN_ROOM;
+        snprintf(msg.content, BUFFER_SIZE, "Room limit reached!");
+        send_message(*client, msg);
+        return;
+    }
+
+    if (room == NULL) {
+        room = &state.rooms[state.room_count++];
+        memset(room, 0, sizeof(*room));
+        strncpy(room->room_name, room_name, sizeof(room->room_name) - 1);
+    }
+
+    if (find_member_index(room, client) >= 0) {
+        return;
+    }
+
+    if (room->member_count >= MAX_CLIENTS) {
+        message_t msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.type = JOIN_ROOM;
+        snprintf(msg.content, BUFFER_SIZE, "Room is full");
+        send_message(*client, msg);
+        return;
+    }
+
+    room->members[room->member_count].client = client;
+    room->members[room->member_count].role = (room->member_count == 0) ? OWNER : MEMBER;
+    room->member_count++;
+
+    client->state = IN_ROOM;
     notify_room_join(client, room_name);
 }
 
-void leave_room(client_t client, char* room_name){
-    for(int i=0; i<state.room_count; i++){
-        if(strncmp(state.rooms[i].room_name, room_name, 50) == 0){
-            state.rooms[i].clients[client.socket] = NULL;
-            client.state = AUTHENTICATED; 
-            return;
+void leave_room(client_t *client, char* room_name){
+    room_t *room = find_room_by_name(room_name);
+    int member_index;
+    int was_owner = 0;
+
+    if (client == NULL) {
+        return;
+    }
+
+    if (room == NULL) {
+        return;
+    }
+
+    member_index = find_member_index(room, client);
+    if (member_index < 0) {
+        return;
+    }
+
+    was_owner = (room->members[member_index].role == OWNER);
+
+    for (int i = member_index; i < room->member_count - 1; ++i) {
+        room->members[i] = room->members[i + 1];
+    }
+    room->member_count--;
+    if (room->member_count >= 0) {
+        room->members[room->member_count].client = NULL;
+        room->members[room->member_count].role = MEMBER;
+    }
+
+    if (was_owner && room->member_count > 0) {
+        room->members[0].role = OWNER;
+    }
+
+    if (room->member_count == 0) {
+        for (int i = 0; i < state.room_count; ++i) {
+            if (&state.rooms[i] == room) {
+                for (int j = i; j < state.room_count - 1; ++j) {
+                    state.rooms[j] = state.rooms[j + 1];
+                }
+                state.room_count--;
+                break;
+            }
         }
     }
+
+    client->state = AUTHENTICATED;
     notify_room_leave(client, room_name);
 }
 
@@ -430,9 +566,14 @@ void cleanup_client(client_t *client){
         return;
     }
 
-    if (client->socket >= 0 && client->socket < 100) {
-        for(int i = 0; i < state.room_count; i++){
-            state.rooms[i].clients[client->socket] = NULL;
+    for (int i = 0; i < state.room_count; i++) {
+        room_t *room = &state.rooms[i];
+        int member_index = find_member_index(room, client);
+        if (member_index >= 0) {
+            for (int j = member_index; j < room->member_count - 1; ++j) {
+                room->members[j] = room->members[j + 1];
+            }
+            room->member_count--;
         }
     }
 
@@ -513,63 +654,71 @@ open req -x509 -nodes -days 365
 per generare un certificato autofirmato valido per 365 giorni usando una nuova chiave RSA a 2048 bit e salvando la chiave privata in server_key.pem e il certificato in certificato.crt
 */
 void check_command(message_t message, command_check *check, char *arg){
-    if(message.type != ROOM_MESSAGE || message.content[0] != '/'){
+    if (message.type != ROOM_MESSAGE || message.content[0] != '/') {
         *check = UNKNOWN_COMMAND;
         return;
     }
+
+    arg[0] = '\0';
     char *space = strchr(message.content, ' ');
     if (space != NULL) {
-        *space = '\0'; //sostituisce il primo spazio con un terminatore di stringa
-        strcpy(arg, space + 1); //copia l'argomento dopo lo spazio nella variabile arg
+        *space = '\0';
+        strncpy(arg, space + 1, BUFFER_SIZE - 1);
+        arg[BUFFER_SIZE - 1] = '\0';
     }
-    *check = VALID_COMMAND;
-    if (strcmp(message.content, "/join") == 0){
-        join_room(state.server, message.sender_name, arg);
-    }
-    else if(strcmp(message.content, "/leave") == 0) {
-        leave_room(state.server, message.sender_name, arg);
-    }
-    else if(strcmp(message.content, "/rooms") == 0){
-        show_user_rooms(state.server, message.sender_name, arg);
-    }
-    else if(strcmp(message.content, "/users") == 0){
-        show_room_users(state.server, message.sender_name, arg);
-    }
-    else if(strcmp(message.content, "/help") == 0){
-        send_help_message(state.server, message.sender_name);
-    }
-    else {
+
+    if (strcmp(message.content, "/join") == 0 ||
+        strcmp(message.content, "/leave") == 0 ||
+        strcmp(message.content, "/rooms") == 0 ||
+        strcmp(message.content, "/users") == 0 ||
+        strcmp(message.content, "/help") == 0 ||
+        strcmp(message.content, "/show") == 0) {
+        *check = VALID_COMMAND;
+    } else {
         *check = INVALID_COMMAND;
+    }
+}
+
+static void send_message_to_client(server_t server, const char *client_name, message_t message){
+    for (int i = 0; i < server.client_count; ++i) {
+        if (strcmp(server.clients[i].name, client_name) == 0) {
+            send_message(server.clients[i], message);
+            return;
+        }
     }
 }
 
 void send_help_message(server_t server, char* client_name){
     message_t message; 
+    memset(&message, 0, sizeof(message));
     message.type = ROOM_MESSAGE;
     snprintf(message.content, BUFFER_SIZE, "Available commands:\n/join [room_name] - Join or create a room\n/leave [room_name] - Leave a room\n/rooms - List available rooms\n/users [room_name] - List users in a room\n/help - Show this help message");
-    for(int i=0; i<server.client_count; i++){
-        if(strcmp(server.clients[i].name, client_name) == 0){
-            send_message(server.clients[i], message);
-            break;
-        }
-    }
+    send_message_to_client(server, client_name, message);
 }
 
 void show_user_rooms(server_t server, char* client_name, char* arg){
+    (void)arg;
     message_t response; 
     response.type = ROOM_MESSAGE;
-    char rooms_list[BUFFER_SIZE] ;
-    memset(room_list, 0, sizeof(rooms_list));
-    for(int i=0; i<server.room_count; i++){
-        for(int j=0; j<server.rooms[i].client_count; j++){
-            if(strcmp(server.rooms[i].clients[j]->name, client_name) == 0){
-                strcat(room_list, server.rooms[i].room_name);
-                strcat(room_list, "\n"); 
+    char rooms_list[BUFFER_SIZE];
+
+    memset(rooms_list, 0, sizeof(rooms_list));
+    for (int i = 0; i < state.room_count; i++) {
+        for (int j = 0; j < state.rooms[i].member_count; j++) {
+            if (state.rooms[i].members[j].client != NULL &&
+                strcmp(state.rooms[i].members[j].client->name, client_name) == 0) {
+                strncat(rooms_list, state.rooms[i].room_name, sizeof(rooms_list) - strlen(rooms_list) - 1);
+                strncat(rooms_list, "\n", sizeof(rooms_list) - strlen(rooms_list) - 1);
             }
         }
     }
-    room_list[strlen(room_list) - 1] = '\0'; 
-    snprintf(response.content, BUFFER_SIZE, "Rooms you are in:\n%s", room_list);
+
+    if (rooms_list[0] == '\0') {
+        snprintf(response.content, BUFFER_SIZE, "You are not in any room");
+    } else {
+        snprintf(response.content, BUFFER_SIZE, "Rooms you are in:\n%s", rooms_list);
+    }
+
     send_message_to_client(server, client_name, response);
 }
 
@@ -577,29 +726,53 @@ void show_room_users(server_t server, char* client_name, char * arg){
     message_t response; 
     response.type = ROOM_MESSAGE; 
     char user_list[BUFFER_SIZE];
+
     memset(user_list, 0, sizeof(user_list));
-    for(ini=0; i<server.room_count; i++){
-        if(strcmp(server.rooms[i].room_name, arg) == 0){
-            for(int j=0; j<server.rooms[i].client_count; i++){
-                strcat(user_list, server.rooms[i].clients[i].name);
-                strcat(user_list, "\n");
+    for (int i = 0; i < state.room_count; i++) {
+        if (strcmp(state.rooms[i].room_name, arg) == 0) {
+            for (int j = 0; j < state.rooms[i].member_count; j++) {
+                if (state.rooms[i].members[j].client == NULL) {
+                    continue;
+                }
+                strncat(user_list, state.rooms[i].members[j].client->name, sizeof(user_list) - strlen(user_list) - 1);
+                strncat(user_list, " (", sizeof(user_list) - strlen(user_list) - 1);
+                if (state.rooms[i].members[j].role == OWNER) {
+                    strncat(user_list, "owner", sizeof(user_list) - strlen(user_list) - 1);
+                } else if (state.rooms[i].members[j].role == MODERATOR) {
+                    strncat(user_list, "moderator", sizeof(user_list) - strlen(user_list) - 1);
+                } else {
+                    strncat(user_list, "member", sizeof(user_list) - strlen(user_list) - 1);
+                }
+                strncat(user_list, ")\n", sizeof(user_list) - strlen(user_list) - 1);
             }
+            break;
         }
     }
-    user_list[strlen(user_list) - 1] = '\0';
-    snprintf(response.content, BUFFER_SIZE, "Users in room %s:\n%s", arg, user_list);
+
+    if (user_list[0] == '\0') {
+        snprintf(response.content, BUFFER_SIZE, "Room %s not found or empty", arg);
+    } else {
+        snprintf(response.content, BUFFER_SIZE, "Users in room %s:\n%s", arg, user_list);
+    }
+
     send_message_to_client(server, client_name, response);
 }
 
-void notify_room_join(client_t client, char* room_name){
+void notify_room_join(client_t *client, char* room_name){
     message_t notification; 
+
+    if (client == NULL) {
+        return;
+    }
+
+    memset(&notification, 0, sizeof(notification));
     notification.type = ROOM_MESSAGE;
-    snprintf(notification.content, BUFFER_SIZE, "%s has joined the room!", client.name);
+    snprintf(notification.content, BUFFER_SIZE, "%s has joined the room!", client->name);
     for(int i=0; i<state.room_count; i++){
         if(strcmp(state.rooms[i].room_name, room_name) == 0){
-            for(int j=0; j<state.rooms[i].client_count; j++){
-                if(state.rooms[i].clients[j] != NULL && state.rooms[i].clients[j]->socket != client.socket){
-                    send_message(*state.rooms[i].clients[j], notification);
+            for(int j=0; j<state.rooms[i].member_count; j++){
+                if(state.rooms[i].members[j].client != NULL && state.rooms[i].members[j].client->socket != client->socket){
+                    send_message(*state.rooms[i].members[j].client, notification);
                 }
             }
             break;
@@ -607,18 +780,109 @@ void notify_room_join(client_t client, char* room_name){
     }
 }
 
-void notify_room_leave(client_t client, char* room_name){
+void notify_room_leave(client_t *client, char* room_name){
     message_t notification; 
+
+    if (client == NULL) {
+        return;
+    }
+
+    memset(&notification, 0, sizeof(notification));
     notification.type = ROOM_MESSAGE;
-    char content[BUFFER_SIZE];
-    memset(content, 0, sizeof(content));
-    snprintf(content, BUFFER_SIZE, "%s has left the room!", client.name);
+    snprintf(notification.content, BUFFER_SIZE, "%s has left the room!", client->name);
     for(int i=0; i<state.room_count; i++){
         if(strcmp(state.rooms[i].room_name, room_name) == 0){
-            for(int j=0; j<state.rooms[i].client_count; j++){
-                if(state.rooms[i].clients[j] != NULL && state.rooms[i].clients[j]->socket != client.socket){
-                    send_message(*state.rooms[i].clients[j], notification);
+            for(int j=0; j<state.rooms[i].member_count; j++){
+                if(state.rooms[i].members[j].client != NULL && state.rooms[i].members[j].client->socket != client->socket){
+                    send_message(*state.rooms[i].members[j].client, notification);
                 }
+            }
+            break;
+        }
+    }
+}
+
+void store_message(server_t server, char* room_name, message_t message){
+    (void)server;
+    (void)room_name;
+    FILE *F = fopen("message_history.txt", "a");
+    if(F == NULL){
+        printf("Error opening message history file for writing\n");
+        return;
+    }
+    fprintf(F, "|%s|%s|%s|%d|%d|%d|\n", message.sender_name, message.receiver_name, message.content, message.type, message.length, message.flags);
+    fclose(F);
+}
+
+void show_messages(server_t server, char* client_name, char* arg){
+    FILE *F = fopen("message_history.txt", "r");
+    message_t response;
+    if(F == NULL){
+        printf("Error opening message history file for reading\n");
+        return;
+    }
+
+    memset(&response, 0, sizeof(response));
+    response.type = ROOM_MESSAGE;
+
+    char line[BUFFER_SIZE]; 
+    char messages[BUFFER_SIZE];
+    memset(messages, 0, sizeof(messages));
+    while(fgets(line, sizeof(line), F)){
+        char sender[50], receiver[50], content[BUFFER_SIZE];
+        int type, length, flags;
+        if (sscanf(line, "|%49[^|]|%49[^|]|%4095[^|]|%d|%d|%d|", sender, receiver, content, &type, &length, &flags) != 6) {
+            continue;
+        }
+        if((strcmp(sender, client_name) == 0 || strcmp(receiver, client_name) == 0) &&
+            (arg[0] == '\0' || strcmp(arg, "all") == 0 || strcmp(arg, sender) == 0 || strcmp(arg, receiver) == 0)){
+            strncat(messages, line, sizeof(messages) - strlen(messages) - 1);
+        }
+    }
+
+    fclose(F);
+
+    if (messages[0] == '\0') {
+        snprintf(response.content, BUFFER_SIZE, "No messages found");
+    } else {
+        snprintf(response.content, BUFFER_SIZE, "%s", messages);
+    }
+    send_message_to_client(server, client_name, response);
+}
+
+void acknowledge_message(client_t client, message_t message){
+    message_t ack; 
+    ack.type = ACK;
+    snprintf(ack.content, BUFFER_SIZE, "The server has accepted the message: %s", message.content);
+    send_message(client, ack);
+}
+
+void ban_user_from_room(client_t *client, char* room_name, char* target_name){
+    room_t *room = find_room_by_name(room_name);
+    if (client == NULL || room == NULL) {
+        return;
+    }
+    int client_index = find_member_index(room, client);
+    if (client_index < 0 || room->members[client_index].role != OWNER) {
+        message_t msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.type = ROOM_MESSAGE;
+        snprintf(msg.content, BUFFER_SIZE, "Only the room owner can ban users");
+        send_message(*client, msg);
+        return;
+    }
+    for(int i = 0; i<room->member_count; i++){
+        if(room->members[i].client != NULL && strcmp(room->members[i].client->name, target_name) == 0){
+            message_t notification;
+            memset(&notification, 0, sizeof(notification));
+            notification.type = ROOM_MESSAGE;
+            snprintf(notification.content, BUFFER_SIZE, "You have been banned from room %s by the owner", room_name);
+            send_message(*room->members[i].client, notification);
+            leave_room(room->members[i].client, room_name);
+            if(room->banned_count < MAX_CLIENTS){
+                room->banned_clients[room->banned_count++] = room->members[i].client;
+            } else {
+                printf("Warning: banned clients limit reached for room %s, cannot track more banned users\n", room_name);
             }
             break;
         }

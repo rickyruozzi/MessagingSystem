@@ -16,7 +16,9 @@ typedef enum type_t {
     ROOM_MESSAGE,
     JOIN_ROOM,
     LEAVE_ROOM,
-    PING
+    PING,
+    ACK, 
+    BAN_USER
 } type_t;
 
 typedef struct message_t {
