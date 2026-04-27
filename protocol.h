@@ -18,7 +18,8 @@ typedef enum type_t {
     LEAVE_ROOM,
     PING,
     ACK, 
-    BAN_USER
+    BAN_USER, 
+    UNBAN_USER
 } type_t;
 
 typedef struct message_t {

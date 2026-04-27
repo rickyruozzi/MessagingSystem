@@ -863,11 +863,11 @@ void ban_user_from_room(client_t *client, char* room_name, char* target_name){
         return;
     }
     int client_index = find_member_index(room, client);
-    if (client_index < 0 || room->members[client_index].role != OWNER) {
+    if (client_index < 0 || room->members[client_index].role != OWNER && room->members[client_index].role != MODERATOR) {
         message_t msg;
         memset(&msg, 0, sizeof(msg));
         msg.type = ROOM_MESSAGE;
-        snprintf(msg.content, BUFFER_SIZE, "Only the room owner can ban users");
+        snprintf(msg.content, BUFFER_SIZE, "Only the room owner or moderator can ban users");
         send_message(*client, msg);
         return;
     }
@@ -876,14 +876,44 @@ void ban_user_from_room(client_t *client, char* room_name, char* target_name){
             message_t notification;
             memset(&notification, 0, sizeof(notification));
             notification.type = ROOM_MESSAGE;
-            snprintf(notification.content, BUFFER_SIZE, "You have been banned from room %s by the owner", room_name);
+            snprintf(notification.content, BUFFER_SIZE, "You have been banned from room %s by the owner or a moderator", room_name);
             send_message(*room->members[i].client, notification);
-            leave_room(room->members[i].client, room_name);
             if(room->banned_count < MAX_CLIENTS){
                 room->banned_clients[room->banned_count++] = room->members[i].client;
             } else {
                 printf("Warning: banned clients limit reached for room %s, cannot track more banned users\n", room_name);
             }
+            leave_room(room->members[i].client, room_name);
+            break;
+        }
+    }
+}
+
+void unban_user_from_room(client_t *client, char* room_name, char* target_name){
+    room_t *room = find_room_by_name(room_name);
+    if (client == NULL || room == NULL) {
+        return;
+    }
+    int client_index = find_member_index(room, client);
+    if(client_index < 0 || room->members[client_index].role != OWNER && room->members[client_index].role != MODERATOR) {
+        message_t msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.type = ROOM_MESSAGE;
+        snprintf(msg.content, BUFFER_SIZE, "Only the room owner or moderator can unban users");
+        send_message(*client, msg);
+        return;
+    }
+    for(int i = 0; i<room->banned_count; i++){
+        if(room->banned_clients[i] != NULL && strcmp(room->banned_clients[i]->name, target_name) == 0){
+            for(int j = i; j<room->banned_count - 1; j++){
+                room->banned_clients[j] = room->banned_clients[j + 1];
+            }
+            room->banned_clients[--room->banned_count] = NULL;
+            message_t notification;
+            memset(&notification, 0, sizeof(notification));
+            notification.type = ROOM_MESSAGE;
+            snprintf(notification.content, BUFFER_SIZE, "You have been unbanned from room %s by the owner or a moderator", room_name);
+            send_message_to_client(*client, target_name, notification);
             break;
         }
     }

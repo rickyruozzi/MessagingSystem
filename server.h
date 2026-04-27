@@ -98,5 +98,6 @@ void store_message(server_t server, char *room_name, message_t message);
 void show_messages(server_t server, char *client_name, char *arg);
 void acknowledge_message(client_t client, message_t message);
 void ban_user_from_room(client_t * client, char *room_name, char *target_name);
+void unban_user_from_room(client_t * client, char *room_name, char *target_name);
 
 #endif
